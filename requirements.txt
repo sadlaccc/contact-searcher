@@ -1,0 +1,12 @@
+docx2txt
+pandas
+pypdf
+streamlit
+langchain_community.tools.tavily_search 
+TavilySearchResults
+langchain_core.output_parsers
+JsonOutputParser
+langchain_core.prompts
+ChatPromptTemplate
+langchain_openai
+ChatOpenAI
