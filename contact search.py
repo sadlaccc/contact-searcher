@@ -5,152 +5,191 @@ import streamlit as st
 import pandas as pd
 import PyPDF2
 from docx import Document
-
-from langchain_core.output_parsers import JsonOutputParser
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
-from langchain_community.tools.tavily_search import TavilySearchResults
+import openai
+from tavily import TavilyClient
 
 st.set_page_config(page_title="Doc to Lead Generator", page_icon="📊", layout="wide")
 
-st.title("📊 Document-Based Lead & Email Finder")
-st.markdown("Find company contacts from documents")
+st.title("📊 Document to Lead Generator")
+st.markdown("Upload documents or paste text to find company emails")
 
 # Sidebar
 st.sidebar.header("🔑 API Keys")
-openai_key = st.sidebar.text_input("OpenAI API Key", type="password")
-tavily_key = st.sidebar.text_input("Tavily API Key", type="password")
+openai_key = st.sidebar.text_input("OpenAI API Key", type="password", value=os.getenv("OPENAI_API_KEY", ""))
+tavily_key = st.sidebar.text_input("Tavily API Key", type="password", value=os.getenv("TAVILY_API_KEY", ""))
 
 st.sidebar.markdown("---")
-model_name = st.sidebar.selectbox("Model", ["gpt-4o-mini", "gpt-3.5-turbo"])
+model_name = st.sidebar.selectbox("OpenAI Model", ["gpt-4o-mini", "gpt-3.5-turbo"])
 max_results = st.sidebar.slider("Max Search Results", 3, 10, 5)
 override_query = st.sidebar.text_input("Override Search Query", "")
 
 # ====================== HELPERS ======================
-def extract_text(file) -> str:
+def extract_text(file):
     try:
         if file.type == "application/pdf":
             reader = PyPDF2.PdfReader(file)
             return "\n".join(page.extract_text() or "" for page in reader.pages)
-        
         elif file.type in ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
             doc = Document(file)
-            return "\n".join(p.text for p in doc.paragraphs)
-        
+            return "\n".join(paragraph.text for paragraph in doc.paragraphs)
         elif file.type == "text/plain":
             return file.getvalue().decode("utf-8", errors="replace")
         return ""
     except Exception as e:
-        st.error(f"Failed to read {file.name}: {e}")
+        st.error(f"Error reading file: {e}")
         return ""
 
 def clean_text(text):
     return " ".join(str(text).split())[:8000]
 
-def build_search_query(text: str, model: str):
-    prompt = ChatPromptTemplate.from_template(
-        "Extract the main company/organization name.\nReturn only JSON: {{\"search_query\": \"...\"}}\n\nText: {text}"
-    )
-    llm = ChatOpenAI(model=model, temperature=0)
-    chain = prompt | llm | JsonOutputParser()
+def get_search_query(text: str):
     try:
-        result = chain.invoke({"text": text})
-        return result.get("search_query", "").strip()
-    except:
+        response = openai.chat.completions.create(
+            model=model_name,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": f"""Extract the main company or organization name from this text for contact search.
+Return only the name, nothing else.
+
+Text: {text[:6000]}"""}
+            ]
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        st.error(f"Query generation failed: {e}")
         return ""
 
-def search_web(query: str):
+def search_with_tavily(query: str):
     try:
-        tool = TavilySearchResults(max_results=max_results)
-        results = tool.invoke(query + " official contact email")
-        if isinstance(results, dict) and "results" in results:
-            results = results["results"]
-        return results if isinstance(results, list) else []
-    except:
+        client = TavilyClient(api_key=tavily_key)
+        results = client.search(
+            query=query + " official contact email OR info@ OR sales@",
+            max_results=max_results
+        )
+        return results.get("results", [])
+    except Exception as e:
+        st.error(f"Search failed: {e}")
         return []
 
-def extract_lead(query: str, context: str, model: str):
-    prompt = ChatPromptTemplate.from_template(
-        "Extract company name and best contact email from results.\n"
-        "Return only JSON: {{\"company_name\": \"\", \"email\": \"\", \"website\": \"\"}}\n\n"
-        "Query: {query}\n\nResults:\n{context}"
-    )
-    llm = ChatOpenAI(model=model, temperature=0)
-    chain = prompt | llm | JsonOutputParser()
+def extract_lead_info(query: str, search_results):
+    context = "\n\n".join([f"URL: {r.get('url')}\nContent: {r.get('content', '')[:400]}" for r in search_results])
+    
     try:
-        result = chain.invoke({"query": query, "context": context})
-        return {
-            "company_name": result.get("company_name", "Not Found"),
-            "email": result.get("email", "Not Found"),
-            "website": result.get("website", "Not Found")
-        }
-    except:
+        response = openai.chat.completions.create(
+            model=model_name,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": "You are a lead generation expert."},
+                {"role": "user", "content": f"""From the search results below, extract:
+- Company Name
+- Best contact email (info@, sales@, contact@ preferred)
+- Website (if available)
+
+Return in this exact format:
+Company: 
+Email: 
+Website: 
+
+Search Query: {query}
+
+Results:
+{context}"""}
+            ]
+        )
+        text = response.choices[0].message.content
+        company = "Not Found"
+        email = "Not Found"
+        website = "Not Found"
+        
+        for line in text.split("\n"):
+            if line.lower().startswith("company"):
+                company = line.split(":", 1)[-1].strip()
+            elif line.lower().startswith("email"):
+                email = line.split(":", 1)[-1].strip()
+            elif line.lower().startswith("website"):
+                website = line.split(":", 1)[-1].strip()
+        
+        return {"company_name": company, "email": email, "website": website}
+    except Exception as e:
+        st.error(f"Lead extraction failed: {e}")
         return {"company_name": "Error", "email": "Not Found", "website": ""}
 
 # Session State
 if "leads" not in st.session_state:
     st.session_state.leads = []
 
-# Main UI
-uploaded_files = st.file_uploader("Upload files (PDF, DOCX, TXT)", 
+# Main Interface
+uploaded_files = st.file_uploader("Upload PDF / DOCX / TXT", 
                                  type=["pdf", "docx", "txt"], 
                                  accept_multiple_files=True)
 
-manual_text = st.text_area("Or paste text", height=150)
+manual_text = st.text_area("Or paste text here", height=180)
 
-if st.button("🚀 Process", type="primary", use_container_width=True):
+if st.button("🚀 Process Documents", type="primary", use_container_width=True):
     if not openai_key or not tavily_key:
-        st.error("Please provide both API keys.")
+        st.error("Please enter both API keys in the sidebar.")
         st.stop()
 
-    os.environ["OPENAI_API_KEY"] = openai_key
-    os.environ["TAVILY_API_KEY"] = tavily_key
+    openai.api_key = openai_key
 
-    docs = []
+    documents = []
     for file in uploaded_files:
         text = extract_text(file)
         if text.strip():
-            docs.append({"source": file.name, "text": clean_text(text)})
+            documents.append({"source": file.name, "text": clean_text(text)})
 
     if manual_text.strip():
-        docs.append({"source": "Manual", "text": clean_text(manual_text)})
+        documents.append({"source": "Manual Input", "text": clean_text(manual_text)})
 
-    if not docs:
-        st.warning("No text found.")
+    if not documents:
+        st.warning("No valid text found.")
         st.stop()
 
-    progress = st.progress(0)
-    for i, doc in enumerate(docs):
-        st.write(f"Processing: **{doc['source']}**")
+    progress_bar = st.progress(0)
+
+    for i, doc in enumerate(documents):
+        st.info(f"Processing: **{doc['source']}**")
         
-        query = override_query or build_search_query(doc["text"], model_name)
+        query = override_query.strip() or get_search_query(doc["text"])
         if not query:
             query = doc["source"]
 
-        results = search_web(query)
+        with st.spinner("Searching web..."):
+            results = search_with_tavily(query)
+
         if results:
-            context = "\n---\n".join([f"{r.get('url')}: {r.get('content', '')[:300]}" for r in results])
-            lead = extract_lead(query, context, model_name)
-            lead.update({"source": doc["source"], "search_query": query})
-            st.session_state.leads.append(lead)
+            with st.spinner("Extracting lead details..."):
+                lead = extract_lead_info(query, results)
+                lead["source"] = doc["source"]
+                lead["search_query"] = query
+                st.session_state.leads.append(lead)
 
-        progress.progress((i+1)/len(docs))
+        progress_bar.progress((i + 1) / len(documents))
 
-    st.success("Done!")
+    st.success("✅ Processing completed!")
 
-# Show Results
+# Results
 if st.session_state.leads:
+    st.subheader("📋 Extracted Leads")
     df = pd.DataFrame(st.session_state.leads)
     st.dataframe(df, use_container_width=True)
 
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False)
-    st.download_button("Download Excel", buf.getvalue(), "leads.xlsx", 
-                      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     
-    if st.button("Clear"):
+    st.download_button(
+        label="📥 Download Excel",
+        data=output.getvalue(),
+        file_name="leads.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    if st.button("🗑️ Clear Results"):
         st.session_state.leads = []
         st.rerun()
+else:
+    st.info("Upload files or paste text then click **Process Documents**")
 
-st.caption("Streamlit Cloud Optimized Version")
+st.caption("Light version optimized for free Streamlit Cloud")
